@@ -1337,18 +1337,99 @@ func (w *Worktree) Clean(opts *CleanOptions) error {
 	if err != nil {
 		return err
 	}
-
-	root := ""
-	files, err := w.filesystem.ReadDir(root)
+	cfg, err := w.r.Config()
 	if err != nil {
 		return err
 	}
-	return w.doClean(s, opts, root, files)
+
+	// Like Status, Clean works on the names it lists, so it uses the
+	// worktree filesystem directly, and removes an untracked directory
+	// named like a .git alias, such as git~1, as Git does. Every removal
+	// still refuses a path through a symlink, as the worktree filesystem
+	// does, so a directory swapped for a link after it was listed is
+	// not followed.
+	root := ""
+	files, err := w.filesystem.Filesystem.ReadDir(root)
+	if err != nil {
+		return err
+	}
+
+	guard := cleanGuard{ignoreCase: cfg.Core.IgnoreCase, gitDirs: w.gitDirInfos()}
+	return w.doClean(s, opts, guard, root, files)
 }
 
-func (w *Worktree) doClean(status Status, opts *CleanOptions, dir string, files []fs.DirEntry) error {
+// cleanGuard decides which listed entries Clean leaves alone because they
+// may be the repository's own Git directory.
+//
+// Git skips .git, and under core.ignorecase .git in any case [1]. With
+// core.ignorecase false, Git lists an untracked .GIT and `git clean -fd`
+// removes it, even where a case-insensitive filesystem makes it the
+// repository's own directory. Clean diverges from Git in two ways so it
+// can never remove that directory:
+//
+//   - with core.ignorecase unset, it skips .git in any case. Git's init
+//     sets the key on a case-insensitive filesystem; go-git's does not, so
+//     unset says nothing about the filesystem.
+//   - it skips any directory that is the storer's Git directory or, for a
+//     linked worktree, its common directory, compared with os.SameFile,
+//     whatever its name and the setting say. This needs a storer that
+//     exposes an operating system filesystem; on others, such as memfs,
+//     only the name rules apply.
+//
+// Status follows Git and lists such a directory's files as untracked.
+//
+// [1]: https://github.com/git/git/blob/v2.54.0/dir.c#L2439
+type cleanGuard struct {
+	ignoreCase config.OptBool
+	gitDirs    []os.FileInfo
+}
+
+func (g cleanGuard) skip(e fs.DirEntry) bool {
+	name := e.Name()
+	if isGitDirName(name, g.ignoreCase.IsTrue() || !g.ignoreCase.IsSet()) {
+		return true
+	}
+	if len(g.gitDirs) == 0 || !e.IsDir() {
+		return false
+	}
+	fi, err := e.Info()
+	if err != nil {
+		return false
+	}
+	for _, d := range g.gitDirs {
+		if os.SameFile(fi, d) {
+			return true
+		}
+	}
+	return false
+}
+
+// gitDirInfos returns the file information of the storer's Git directory
+// and, for a linked worktree, of its common directory. It returns nothing
+// for a storer that does not expose a filesystem, and leaves out a
+// directory that cannot be read.
+func (w *Worktree) gitDirInfos() []os.FileInfo {
+	s, ok := w.r.Storer.(interface{ Filesystem() billy.Filesystem })
+	if !ok || s.Filesystem() == nil {
+		return nil
+	}
+	fss := []billy.Filesystem{s.Filesystem()}
+	if c, ok := s.Filesystem().(interface{ CommonFilesystem() billy.Filesystem }); ok && c.CommonFilesystem() != nil {
+		fss = append(fss, c.CommonFilesystem())
+	}
+	var infos []os.FileInfo
+	for _, fs := range fss {
+		if fi, err := fs.Stat("."); err == nil {
+			infos = append(infos, fi)
+		}
+	}
+	return infos
+}
+
+func (w *Worktree) doClean(status Status, opts *CleanOptions, guard cleanGuard, dir string, files []fs.DirEntry) error {
+	wfs := w.filesystem.Filesystem
 	for _, fi := range files {
-		if fi.Name() == GitDirName {
+		if guard.skip(fi) {
 			continue
 		}
 
@@ -1359,27 +1440,43 @@ func (w *Worktree) doClean(status Status, opts *CleanOptions, dir string, files 
 				continue
 			}
 
-			subfiles, err := w.filesystem.ReadDir(path)
+			subfiles, err := wfs.ReadDir(path)
 			if err != nil {
 				return err
 			}
-			err = w.doClean(status, opts, path, subfiles)
+			err = w.doClean(status, opts, guard, path, subfiles)
 			if err != nil {
 				return err
 			}
 		} else if status.IsUntracked(path) {
-			if err := w.filesystem.Remove(path); err != nil {
+			if err := w.filesystem.validNoLeadingSymlink(path); err != nil {
+				return err
+			}
+			if err := wfs.Remove(path); err != nil {
 				return err
 			}
 		}
 	}
 
 	if opts.Dir && dir != "" {
-		_, err := removeDirIfEmpty(w.filesystem, dir)
+		if err := w.filesystem.validNoLeadingSymlink(dir); err != nil {
+			return err
+		}
+		_, err := removeDirIfEmpty(wfs, dir)
 		return err
 	}
 
 	return nil
+}
+
+// isGitDirName reports whether a listed name is the repository's own
+// directory, which Status and Clean skip: .git, or under core.ignorecase
+// .git in any case, as Git's fspathcmp compares it.
+func isGitDirName(name string, ignoreCase bool) bool {
+	if ignoreCase {
+		return strings.EqualFold(name, GitDirName)
+	}
+	return name == GitDirName
 }
 
 // GrepResult is structure of a grep result.
