@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-billy/v6/osfs"
 
 	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/internal/pathutil"
@@ -2499,7 +2500,13 @@ func invalidCommonDir(common, missing string) error {
 
 // pathErrCause returns the cause of a path error, so an error message that
 // already quotes the path does not repeat it, and err itself otherwise.
+// go-billy reports a path leaving its root as a wrapped
+// [osfs.ErrPathEscapesParent] quoting the whole path, so that is reduced to
+// the sentinel.
 func pathErrCause(err error) error {
+	if errors.Is(err, osfs.ErrPathEscapesParent) {
+		return osfs.ErrPathEscapesParent
+	}
 	if pe, ok := errors.AsType[*iofs.PathError](err); ok {
 		return pe.Err
 	}
