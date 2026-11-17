@@ -210,33 +210,40 @@ var utf8BOM = []byte("\xef\xbb\xbf")
 // directory domain, skipping the lines Git ignores with a warning: one of
 // maxAttributesLine bytes or more, one that does not parse, such as an
 // invalid attribute name or a macro outside a file that may define them
-// (macros), and a negative pattern. With bom, a UTF-8 byte order mark at
-// the start is dropped, as Git drops it from a file. Reading stops at
-// maxAttributesFile bytes, or at a read error, keeping what was read.
-func parseAttributes(r io.Reader, domain []string, macros, bom bool) []gitattributes.MatchAttribute {
+// (macros), and a negative pattern. A line ends at a NUL, which Git reads
+// as the end of a C string. Reading a blob, as opposed to a file, stops at
+// the first NUL and counts a CR ending a line toward its length. With file,
+// a UTF-8 byte order mark at the start is dropped, as Git drops it from a
+// file. Reading stops at maxAttributesFile bytes, or at a read error,
+// keeping what was read.
+func parseAttributes(r io.Reader, domain []string, macros, file bool) []gitattributes.MatchAttribute {
 	br := bufio.NewReader(io.LimitReader(r, maxAttributesFile))
 
 	var attrs []gitattributes.MatchAttribute
 	for first := true; ; first = false {
-		line, tooLong, err := readAttributesLine(br)
-		if first && bom {
+		line, tooLong, err := readAttributesLine(br, file)
+		if first && file {
 			line = bytes.TrimPrefix(line, utf8BOM)
+		}
+		nul := bytes.IndexByte(line, 0)
+		if nul >= 0 {
+			line = line[:nul]
 		}
 		if !tooLong && len(line) < maxAttributesLine {
 			if m, ok := parseAttributesLine(string(line), domain, macros); ok {
 				attrs = append(attrs, m)
 			}
 		}
-		if err != nil {
+		if err != nil || (nul >= 0 && !file) {
 			return attrs
 		}
 	}
 }
 
-// readAttributesLine reads a line from br without its line ending. It keeps
-// at most maxAttributesLine bytes of it, and reports whether there were
-// more.
-func readAttributesLine(br *bufio.Reader) (line []byte, tooLong bool, err error) {
+// readAttributesLine reads a line from br without its line ending, which
+// for a blob is the LF alone. It keeps at most maxAttributesLine bytes of
+// it, and reports whether there were more.
+func readAttributesLine(br *bufio.Reader, file bool) (line []byte, tooLong bool, err error) {
 	for {
 		chunk, err := br.ReadSlice('\n')
 		if len(line)+len(chunk) <= maxAttributesLine+2 {
@@ -248,7 +255,9 @@ func readAttributesLine(br *bufio.Reader) (line []byte, tooLong bool, err error)
 			continue
 		}
 		line = bytes.TrimSuffix(line, []byte("\n"))
-		line = bytes.TrimSuffix(line, []byte("\r"))
+		if file {
+			line = bytes.TrimSuffix(line, []byte("\r"))
+		}
 		return line, tooLong, err
 	}
 }
