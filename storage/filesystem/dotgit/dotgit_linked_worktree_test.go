@@ -191,6 +191,14 @@ func TestRepositoryFilesystemRoutesFilesAndTheirLockAndStagingFiles(t *testing.T
 		{"index", false},
 		{"config.worktree", false},
 		{"logs/HEAD", false},
+		{"refs/bisect/bad", false},
+		{"refs/rewritten/x", false},
+		{"refs/worktree/x", false},
+		{"logs/refs/bisect/bad", false},
+		{"logs/refs/rewritten/x", false},
+		{"logs/refs/worktree/x", false},
+		{"refs/bisect-other", true},
+		{"logs/refs/heads/main", true},
 	}
 	type route struct {
 		path     string
