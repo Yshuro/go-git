@@ -476,27 +476,45 @@ func (d *DotGit) ShallowWriter() (billy.File, error) {
 // while another writer holds the lock.
 //
 // A shallow file that is a symlink is resolved first, as Git does, so the
-// target is replaced and locked, and the link is kept. Only links relative to
-// the Git directory, and at most 40 of them in a chain, are followed.
+// target is locked and replaced and the link is kept. Removing the file
+// removes the link itself and leaves its target alone, again as Git does.
+// Only links relative to the Git directory are followed, at most 5 in a
+// chain, as Git allows. A longer chain, or a link that is absolute or leaves
+// the Git directory, makes SetShallow fail. In a linked worktree, links are
+// relative to the common directory, where the shallow file lives.
 func (d *DotGit) SetShallow(data []byte) (err error) {
+	fsys := d.fs
+	if rfs, ok := fsys.(*RepositoryFilesystem); ok && rfs.commonDotGitFs != nil {
+		fsys = rfs.commonDotGitFs
+	}
+
+	const maxSymlinkDepth = 5
 	shallow := shallowPath
-	for range 40 {
-		fi, err := d.fs.Lstat(shallow)
+	for depth := 0; ; depth++ {
+		fi, err := fsys.Lstat(shallow)
 		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
 			break
 		}
-		link, err := d.fs.Readlink(shallow)
+		if depth == maxSymlinkDepth {
+			return fmt.Errorf("shallow symlink chain longer than %d links", maxSymlinkDepth)
+		}
+		link, err := fsys.Readlink(shallow)
 		if err != nil {
 			return err
 		}
-		if !path.IsAbs(link) {
-			link = path.Join(path.Dir(shallow), link)
+		link = filepath.ToSlash(link)
+		if path.IsAbs(link) || filepath.VolumeName(link) != "" {
+			return fmt.Errorf("shallow symlink %q points outside the git directory", link)
+		}
+		link = path.Join(path.Dir(shallow), link)
+		if link == ".." || strings.HasPrefix(link, "../") {
+			return fmt.Errorf("shallow symlink %q points outside the git directory", link)
 		}
 		shallow = link
 	}
 	shallowLock := shallow + ".lock"
 
-	lock, err := d.fs.OpenFile(shallowLock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+	lock, err := fsys.OpenFile(shallowLock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
 	if err != nil {
 		return err
 	}
@@ -504,7 +522,7 @@ func (d *DotGit) SetShallow(data []byte) (err error) {
 	committed := false
 	defer func() {
 		if !committed {
-			_ = d.fs.Remove(shallowLock)
+			_ = fsys.Remove(shallowLock)
 		}
 	}()
 
@@ -512,7 +530,7 @@ func (d *DotGit) SetShallow(data []byte) (err error) {
 		if err := lock.Close(); err != nil {
 			return err
 		}
-		if err := d.fs.Remove(shallow); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := fsys.Remove(shallowPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		return nil
@@ -526,12 +544,12 @@ func (d *DotGit) SetShallow(data []byte) (err error) {
 		return err
 	}
 
-	err = d.fs.Rename(shallowLock, shallow)
+	err = fsys.Rename(shallowLock, shallow)
 	if errors.Is(err, billy.ErrNotSupported) || (err != nil && runtime.GOOS == "windows") {
 		// Without rename, as on sivafs, or when Windows refuses to rename
 		// over a file another handle has open, the file can only be
 		// rewritten in place.
-		return util.WriteFile(d.fs, shallow, data, 0o666)
+		return util.WriteFile(fsys, shallow, data, 0o666)
 	}
 	if err != nil {
 		return err
