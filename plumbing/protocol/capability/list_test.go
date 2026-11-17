@@ -3,6 +3,7 @@ package capability
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -184,4 +185,40 @@ func (s *SuiteCapabilities) TestZeroValueSafe() {
 	caps.Set(OFSDelta)
 	s.True(caps.Supports(OFSDelta))
 	s.Equal("ofs-delta", caps.String())
+}
+
+func TestListBare(t *testing.T) {
+	t.Parallel()
+
+	l := List{}
+	l.Add("a")
+	l.Add("a", "1")
+	l.Add("b", "1")
+	l.Add("b")
+
+	assert.True(t, l.Bare("a"))
+	assert.True(t, l.BareFirst("a"))
+	assert.True(t, l.Bare("b"))
+	assert.False(t, l.BareFirst("b"))
+	assert.False(t, l.Bare("c"))
+	assert.Equal(t, []string{"1"}, l.Get("a"))
+}
+
+func TestListSetKeepsBareFlagsConsistent(t *testing.T) {
+	t.Parallel()
+
+	l := List{}
+	l.Add("a", "1")
+	l.Set("a")
+	assert.True(t, l.Bare("a"))
+	assert.True(t, l.BareFirst("a"))
+	assert.Empty(t, l.Get("a"))
+
+	l.Add("a", "2")
+	assert.True(t, l.BareFirst("a"))
+
+	l.Set("a", "3")
+	assert.False(t, l.Bare("a"))
+	assert.False(t, l.BareFirst("a"))
+	assert.Equal(t, []string{"3"}, l.Get("a"))
 }
