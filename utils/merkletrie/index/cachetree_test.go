@@ -106,6 +106,16 @@ func TestCacheTreeIgnoresEntriesItCannotTrust(t *testing.T) {
 			},
 		},
 		{
+			name: "all-zero hash",
+			change: func(idx *index.Index) {
+				idx.Cache.Entries[3].Hash = plumbing.ZeroHash
+			},
+			want: map[string][]byte{
+				"": treeHash(cacheTreeRoot), "a": treeHash(cacheTreeA),
+				"a/b": treeHash(cacheTreeAB), "c": zeroDirHash,
+			},
+		},
+		{
 			name: "entry count differs from the index",
 			change: func(idx *index.Index) {
 				idx.Entries = append(idx.Entries, &index.Entry{Name: "c/new", Hash: cacheTreeBlob})
