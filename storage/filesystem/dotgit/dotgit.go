@@ -11,6 +11,7 @@ import (
 	"hash"
 	"io"
 	"maps"
+	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
@@ -54,8 +55,12 @@ const (
 	worktreesPath      = "worktrees"
 	alternatesPath     = "alternates"
 
-	tmpPackedRefsPrefix = "._packed-refs"
-	packedRefsHeader    = "# pack-refs with: "
+	// stagedPackedRefsPrefix starts the names of the files a new packed-refs is
+	// staged in, beside it. Git stages it in packed-refs.new, next to
+	// packed-refs.lock.
+	stagedPackedRefsPrefix = packedRefsPath + "."
+
+	packedRefsHeader = "# pack-refs with: "
 
 	packPrefix = "pack-"
 	packExt    = ".pack"
@@ -1691,6 +1696,19 @@ func (d *DotGit) openAndLockPackedRefs(doCreate bool) (
 	return f, nil
 }
 
+// createStagedPackedRefs creates a new, uniquely named file beside packed-refs
+// for its replacement content, and returns it open for writing. The caller
+// renames it over packed-refs or removes it.
+func (d *DotGit) createStagedPackedRefs() (billy.File, error) {
+	for {
+		name := fmt.Sprintf("%s%016x", stagedPackedRefsPrefix, rand.Uint64())
+		f, err := d.fs.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		if !errors.Is(err, os.ErrExist) {
+			return f, err
+		}
+	}
+}
+
 func (d *DotGit) rewritePackedRefsWithoutRef(name plumbing.ReferenceName) (err error) {
 	pr, err := d.openAndLockPackedRefs(false)
 	if err != nil {
@@ -1701,9 +1719,8 @@ func (d *DotGit) rewritePackedRefsWithoutRef(name plumbing.ReferenceName) (err e
 	}
 	defer ioutil.CheckClose(pr, &err)
 
-	// Creating the temp file in the same directory as the target file
-	// improves our chances for rename operation to be atomic.
-	tmp, err := d.fs.TempFile("", tmpPackedRefsPrefix)
+	// Staging the new file beside the target keeps the rename atomic.
+	tmp, err := d.createStagedPackedRefs()
 	if err != nil {
 		return err
 	}
@@ -1966,7 +1983,7 @@ func (d *DotGit) PackRefs() (err error) {
 	}
 
 	// Write them all to a new temp packed-refs file.
-	tmp, err := d.fs.TempFile("", tmpPackedRefsPrefix)
+	tmp, err := d.createStagedPackedRefs()
 	if err != nil {
 		return err
 	}
