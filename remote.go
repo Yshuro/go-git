@@ -169,11 +169,14 @@ func (r *Remote) sendPack(ctx context.Context, sess transport.Session, remoteRef
 	}
 
 	// TODO: support delete-refs
-	caps := sess.Capabilities() // server capabilities
+	var caps capability.List // server capabilities
+	if c := sess.Capabilities(); c != nil {
+		caps = *c
+	}
 	// git's send-pack refuses a server that cannot store the local object
 	// format before it looks at the refs, so a push that would be rejected
 	// or has nothing to send fails with the format error too.
-	if err := xtransport.CheckPushObjectFormat(r.s, *caps); err != nil {
+	if err := xtransport.CheckPushObjectFormat(r.s, caps); err != nil {
 		return err
 	}
 	if isDelete && !caps.Supports(capability.DeleteRefs) {

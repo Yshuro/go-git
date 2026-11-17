@@ -33,6 +33,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/go-git/go-git/v6/storage/filesystem"
 	"github.com/go-git/go-git/v6/storage/memory"
@@ -2846,4 +2847,22 @@ func TestFetchShallowSHA256(t *testing.T) {
 			require.Equal(t, []plumbing.Hash{head}, shallows)
 		})
 	}
+}
+
+type nilCapabilitiesSession struct {
+	transport.Session
+}
+
+func (nilCapabilitiesSession) Capabilities() *capability.List { return nil }
+
+func TestSendPackSessionWithoutCapabilities(t *testing.T) {
+	t.Parallel()
+	r := NewRemote(memory.NewStorage(), &config.RemoteConfig{Name: "origin"})
+	remoteRefs := memory.NewStorage()
+
+	err := r.sendPack(context.Background(), nilCapabilitiesSession{}, remoteRefs, &PushOptions{
+		RefSpecs: []config.RefSpec{"refs/heads/main:refs/heads/main"},
+	})
+
+	require.ErrorIs(t, err, NoErrAlreadyUpToDate)
 }
