@@ -1,9 +1,11 @@
 package git
 
 import (
+	"crypto"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -747,4 +749,158 @@ func TestCheckoutCreateDoesNotOverwriteBranchCreatedDuringReset(t *testing.T) {
 	ref, err := r.Reference(branch, true)
 	require.NoError(t, err)
 	assert.Equal(t, c2, ref.Hash())
+}
+
+// repoWithNestedCacheTree has Git commit a nested layout, which leaves a
+// valid cache-tree in the index.
+func repoWithNestedCacheTree(t *testing.T) string {
+	t.Helper()
+	requireGitBinary(t)
+
+	dir := t.TempDir()
+	git(t, dir, "init", "-q")
+	for _, name := range []string{"top", "a/f", "a/b/g", "a/b/c/h", "d/e"} {
+		require.NoError(t, os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(name+"\n"), 0o644))
+	}
+	git(t, dir, "add", ".")
+	git(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c")
+	return dir
+}
+
+// cacheTreeOnDisk lists the cache-tree of the index file as "dir/:valid" or
+// "dir/:invalid", the root being "".
+func cacheTreeOnDisk(t *testing.T, dir string) []string {
+	t.Helper()
+
+	f, err := os.Open(filepath.Join(dir, ".git", "index"))
+	require.NoError(t, err)
+	defer f.Close()
+	idx := &index.Index{}
+	require.NoError(t, index.NewDecoder(f, crypto.SHA1.New()).Decode(idx))
+	require.NotNil(t, idx.Cache, "the index file has no cache-tree")
+
+	var out []string
+	var walk func(pos int, prefix string) int
+	walk = func(pos int, prefix string) int {
+		e := idx.Cache.Entries[pos]
+		path := prefix
+		if e.Path != "" {
+			path += e.Path + "/"
+		}
+		state := "invalid"
+		if e.Entries >= 0 {
+			state = "valid"
+		}
+		out = append(out, path+":"+state)
+		next := pos + 1
+		for range e.Trees {
+			next = walk(next, path)
+		}
+		return next
+	}
+	walk(0, "")
+	sort.Strings(out)
+	return out
+}
+
+func requireGitAcceptsIndexOf(t *testing.T, dir string) {
+	t.Helper()
+	git(t, dir, "fsck", "--strict")
+	_, ok := gitAllowFail(t, dir, "diff-files", "--quiet")
+	require.True(t, ok)
+	probe := t.TempDir()
+	require.NoError(t, os.CopyFS(probe, os.DirFS(dir)))
+	want := strings.TrimSpace(git(t, probe, "write-tree"))
+	git(t, probe, "read-tree", "--empty")
+	git(t, probe, "read-tree", want)
+	require.Equal(t, want, strings.TrimSpace(git(t, probe, "write-tree")))
+	require.Equal(t, want, strings.TrimSpace(git(t, dir, "write-tree")))
+}
+
+// Git trusts a valid cache-tree entry as the tree of its directory, so an
+// index that go-git changes must come back from go-git with the directory
+// and all those above it invalid, and with nothing else lost.
+func TestAddInvalidatesTheCacheTreeGitReads(t *testing.T) {
+	t.Parallel()
+
+	dir := repoWithNestedCacheTree(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "a", "b", "g"), []byte("changed\n"), 0o644))
+
+	r, err := PlainOpen(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	w, err := r.Worktree()
+	require.NoError(t, err)
+	_, err = w.Add("a/b/g")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{":invalid", "a/:invalid", "a/b/:invalid", "a/b/c/:valid", "d/:valid"}, cacheTreeOnDisk(t, dir))
+	requireGitAcceptsIndexOf(t, dir)
+
+	reference := t.TempDir()
+	require.NoError(t, os.CopyFS(reference, os.DirFS(dir)))
+	git(t, reference, "add", "a/b/g")
+	assert.Equal(t, strings.TrimSpace(git(t, reference, "write-tree")), strings.TrimSpace(git(t, dir, "write-tree")))
+}
+
+func TestRemoveAndReplaceInvalidateTheCacheTreeGitReads(t *testing.T) {
+	t.Parallel()
+
+	dir := repoWithNestedCacheTree(t)
+
+	r, err := PlainOpen(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	w, err := r.Worktree()
+	require.NoError(t, err)
+
+	_, err = w.Remove("a/b/g")
+	require.NoError(t, err)
+	_, err = w.Remove("a/b/c/h")
+	require.NoError(t, err)
+	require.NoError(t, os.RemoveAll(filepath.Join(dir, "a", "b")))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "a", "b"), []byte("now a file\n"), 0o644))
+	_, err = w.Add("a/b")
+	require.NoError(t, err)
+
+	got := cacheTreeOnDisk(t, dir)
+	assert.Contains(t, got, ":invalid")
+	assert.Contains(t, got, "a/:invalid")
+	assert.Contains(t, got, "d/:valid")
+	assert.NotContains(t, got, "a/b/c/:valid")
+	requireGitAcceptsIndexOf(t, dir)
+
+	status, err := w.Status()
+	require.NoError(t, err)
+	assert.Equal(t, Added, status.File("a/b").Staging, "status: %v", status)
+	assert.Equal(t, Deleted, status.File("a/b/g").Staging, "status: %v", status)
+}
+
+// Git writes the cache-tree and go-git reads it: a go-git Add on top of an
+// index that Git wrote leaves a status that Git agrees with.
+func TestGitAndGoGitAgreeOnStatusAcrossCacheTreeWrites(t *testing.T) {
+	t.Parallel()
+
+	dir := repoWithNestedCacheTree(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "d", "e"), []byte("changed\n"), 0o644))
+
+	r, err := PlainOpen(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	w, err := r.Worktree()
+	require.NoError(t, err)
+	_, err = w.Add("d/e")
+	require.NoError(t, err)
+
+	assert.Equal(t, "M  d/e", strings.TrimSpace(git(t, dir, "status", "--porcelain")))
+	status, err := w.Status()
+	require.NoError(t, err)
+	assert.Equal(t, Modified, status.File("d/e").Staging)
+
+	git(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c2")
+	assert.Empty(t, strings.TrimSpace(git(t, dir, "status", "--porcelain")))
+	status, err = w.Status()
+	require.NoError(t, err)
+	assert.True(t, status.IsClean(), "status: %v", status)
 }
