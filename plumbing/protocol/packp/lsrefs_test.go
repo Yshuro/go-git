@@ -155,6 +155,12 @@ func TestLsRefsOutputDecode(t *testing.T) {
 				name:  "unborn ref other than HEAD is ignored without validation",
 				lines: []string{"unborn refs/heads/topic peeled:nothex"},
 			},
+			{
+				name:           "unborn HEAD ignores peeled",
+				lines:          []string{"unborn HEAD peeled:nothex symref-target:refs/heads/main"},
+				wantRefs:       1,
+				wantUnbornHead: "refs/heads/main",
+			},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -191,6 +197,100 @@ func TestLsRefsOutputDecode(t *testing.T) {
 
 		assert.Equal(t, "refs/tags/v1.0^{}", resp.References[1].Name().String())
 		assert.Equal(t, plumbing.NewHash("c39ae07f393806ccf406ef966e9a15afc43cc36a"), resp.References[1].Hash())
+	})
+
+	t.Run("names advertised by the remote are validated", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name     string
+			line     string
+			wantRefs []*plumbing.Reference
+		}{
+			{
+				name: "ref name escaping refs",
+				line: "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 refs/heads/../../config",
+			},
+			{
+				name: "ref name with invalid characters",
+				line: "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 refs/heads/ma*n",
+			},
+			{
+				name: "one-level ref name other than HEAD",
+				line: "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 ORIG_HEAD",
+				wantRefs: []*plumbing.Reference{
+					plumbing.NewHashReference("ORIG_HEAD", plumbing.NewHash("6ecf0ef2c2dffb796033e5a02219af86ec6584e5")),
+				},
+			},
+			{
+				name: "one-level ref name with invalid characters",
+				line: "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 FO*O",
+			},
+			{
+				name: "one-level ref name @",
+				line: "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 @",
+			},
+			{
+				name: "peeled entry of an invalid ref name",
+				line: "5dc01c595e6c6ec9ccda4f6f69c131c0dd945f8c refs/tags/v1.0.lock peeled:c39ae07f393806ccf406ef966e9a15afc43cc36a",
+			},
+			{
+				name: "invalid ref name is skipped before its attributes are read",
+				line: "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 refs/heads/ma*n peeled:nothex",
+			},
+			{
+				name: "symref-target escaping refs",
+				line: "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 HEAD symref-target:refs/heads/../../config",
+				wantRefs: []*plumbing.Reference{
+					plumbing.NewHashReference(plumbing.HEAD, plumbing.NewHash("6ecf0ef2c2dffb796033e5a02219af86ec6584e5")),
+				},
+			},
+			{
+				name: "symref-target with invalid characters",
+				line: "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 HEAD symref-target:refs/heads/ma*n",
+				wantRefs: []*plumbing.Reference{
+					plumbing.NewHashReference(plumbing.HEAD, plumbing.NewHash("6ecf0ef2c2dffb796033e5a02219af86ec6584e5")),
+				},
+			},
+			{
+				name: "one-level symref-target",
+				line: "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 refs/remotes/origin/HEAD symref-target:HEAD",
+				wantRefs: []*plumbing.Reference{
+					plumbing.NewHashReference("refs/remotes/origin/HEAD", plumbing.NewHash("6ecf0ef2c2dffb796033e5a02219af86ec6584e5")),
+				},
+			},
+			{
+				name: "invalid symref-target after a valid one",
+				line: "6ecf0ef2c2dffb796033e5a02219af86ec6584e5 HEAD symref-target:refs/heads/main symref-target:../../config",
+				wantRefs: []*plumbing.Reference{
+					plumbing.NewSymbolicReference(plumbing.HEAD, "refs/heads/main"),
+				},
+			},
+			{
+				name: "unborn symref-target escaping refs",
+				line: "unborn HEAD symref-target:../../config",
+			},
+			{
+				name: "unborn HEAD reads only its first symref-target",
+				line: "unborn HEAD symref-target:../../config symref-target:refs/heads/main",
+			},
+			{
+				name: "unborn symref-target with invalid characters",
+				line: "unborn HEAD symref-target:refs/heads/this*is*invalid",
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				var buf bytes.Buffer
+				pktline.Writef(&buf, "%s\n", tt.line)
+				pktline.WriteFlush(&buf)
+
+				resp := &LsRefsOutput{}
+				require.NoError(t, resp.Decode(&buf))
+				assert.Equal(t, tt.wantRefs, resp.References)
+				assert.Empty(t, resp.UnbornHead)
+			})
+		}
 	})
 
 	t.Run("malformed lines are rejected", func(t *testing.T) {
