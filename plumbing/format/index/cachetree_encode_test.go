@@ -111,6 +111,10 @@ func TestEncodeWritesTheCacheTreeOfASHA256Repository(t *testing.T) {
 	runGit(t, dir, "fsck", "--strict")
 	assert.Equal(t, runGit(t, dir, "rev-parse", "HEAD^{tree}"), runGit(t, dir, "write-tree"))
 	assert.Empty(t, runGit(t, dir, "status", "--porcelain"))
+
+	idx.Cache = nil
+	root := plumbing.NewHash(runGit(t, dir, "rev-parse", "HEAD^{tree}"))
+	assert.True(t, idx.FillCache(root), "FillCache for a SHA-256 tree")
 }
 
 func writeIndex(t *testing.T, dir string, idx *Index) {

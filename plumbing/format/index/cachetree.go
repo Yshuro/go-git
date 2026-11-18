@@ -317,3 +317,54 @@ func treeSortName(it treeItem) string {
 	}
 	return it.name
 }
+
+// FillCache replaces the cache-tree with one that covers the whole index,
+// provided the tree that the entries make has the hash root. It reports
+// whether it did; when the entries make another tree, or cannot make one Git
+// would write, the cache-tree is left as it was.
+//
+// A cache-tree entry says that the tree object exists, so call FillCache
+// only for a root whose tree objects are all in the object database, such as
+// the tree of a commit that was just written or checked out.
+func (i *Index) FillCache(root plumbing.Hash) bool {
+	sums, ok := i.sumTrees()
+	if !ok {
+		return false
+	}
+	top, ok := sums[""]
+	if !ok || !top.valid || !top.hash.Equal(root) {
+		return false
+	}
+
+	children := make(map[string][]string, len(sums))
+	for dir, s := range sums {
+		if !s.valid {
+			return false
+		}
+		if dir == "" {
+			continue
+		}
+		parent, name := "", dir
+		if n := strings.LastIndexByte(dir, '/'); n >= 0 {
+			parent, name = dir[:n], dir[n+1:]
+		}
+		children[parent] = append(children[parent], name)
+	}
+	for _, names := range children {
+		sort.Strings(names)
+	}
+
+	entries := make([]TreeEntry, 0, len(sums))
+	var add func(dir, name string)
+	add = func(dir, name string) {
+		s := sums[dir]
+		entries = append(entries, TreeEntry{Path: name, Entries: s.entries, Trees: s.subdirs, Hash: s.hash})
+		for _, child := range children[dir] {
+			add(joinPath(dir, child), child)
+		}
+	}
+	add("", "")
+
+	i.Cache = &Tree{Entries: entries}
+	return true
+}

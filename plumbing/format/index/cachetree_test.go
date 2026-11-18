@@ -358,3 +358,33 @@ func TestInvalidateCacheOnAnIndexWithoutOne(t *testing.T) {
 	idx.InvalidateCache("a/b")
 	assert.Nil(t, idx.Cache)
 }
+
+// FillCache builds the cache-tree Git builds for the same entries.
+func TestFillCacheMatchesGits(t *testing.T) {
+	t.Parallel()
+
+	dir := repoWithCacheTree(t)
+	idx := readIndex(t, dir)
+	want := append([]TreeEntry(nil), idx.Cache.Entries...)
+	root := plumbing.NewHash(runGit(t, dir, "rev-parse", "HEAD^{tree}"))
+
+	idx.Cache = nil
+	require.True(t, idx.FillCache(root))
+	assert.Equal(t, want, idx.Cache.Entries)
+}
+
+func TestFillCacheRefusesAnotherTree(t *testing.T) {
+	t.Parallel()
+
+	dir := repoWithCacheTree(t)
+	idx := readIndex(t, dir)
+	idx.Cache = nil
+
+	assert.False(t, idx.FillCache(plumbing.NewHash("1111111111111111111111111111111111111111")))
+	assert.Nil(t, idx.Cache)
+
+	root := plumbing.NewHash(runGit(t, dir, "rev-parse", "HEAD^{tree}"))
+	idx.Entries[0].Stage = AncestorMode
+	assert.False(t, idx.FillCache(root))
+	assert.Nil(t, idx.Cache)
+}
