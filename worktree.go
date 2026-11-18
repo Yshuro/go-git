@@ -1353,8 +1353,12 @@ func (w *Worktree) Clean(opts *CleanOptions) error {
 	if err != nil {
 		return err
 	}
+	idx, err := w.r.Storer.Index()
+	if err != nil {
+		return err
+	}
 
-	guard := cleanGuard{ignoreCase: cfg.Core.IgnoreCase, gitDirs: w.gitDirInfos()}
+	guard := cleanGuard{ignoreCase: cfg.Core.IgnoreCase, gitDirs: w.gitDirInfos(), trackedDirs: indexDirs(idx)}
 	return w.doClean(s, opts, guard, root, files)
 }
 
@@ -1376,12 +1380,36 @@ func (w *Worktree) Clean(opts *CleanOptions) error {
 //     exposes an operating system filesystem; on others, such as memfs,
 //     only the name rules apply.
 //
+// doClean also skips a nested repository, as Git does.
+//
 // Status follows Git and lists such a directory's files as untracked.
 //
 // [1]: https://github.com/git/git/blob/v2.54.0/dir.c#L2439
 type cleanGuard struct {
-	ignoreCase config.OptBool
-	gitDirs    []os.FileInfo
+	ignoreCase  config.OptBool
+	gitDirs     []os.FileInfo
+	trackedDirs map[string]struct{}
+}
+
+// tracked reports whether the index holds an entry below the directory at
+// path.
+func (g cleanGuard) tracked(path string) bool {
+	_, ok := g.trackedDirs[filepath.ToSlash(path)]
+	return ok
+}
+
+// indexDirs returns every directory that holds an index entry below it.
+func indexDirs(idx *index.Index) map[string]struct{} {
+	dirs := make(map[string]struct{})
+	for _, e := range idx.Entries {
+		for dir := path.Dir(e.Name); dir != "." && dir != "/"; dir = path.Dir(dir) {
+			if _, ok := dirs[dir]; ok {
+				break
+			}
+			dirs[dir] = struct{}{}
+		}
+	}
+	return dirs
 }
 
 func (g cleanGuard) skip(e fs.DirEntry) bool {
@@ -1426,6 +1454,131 @@ func (w *Worktree) gitDirInfos() []os.FileInfo {
 	return infos
 }
 
+// isNestedRepository reports whether the directory at path holds a .git
+// that Git takes for a nested repository, which Clean leaves alone as
+// `git clean` does without a second -f [1]. As in Git, doClean asks only
+// for a directory with no index entries below it [2]. Git requires a .git
+// that is a Git directory or a gitfile pointing at one [3]; any other,
+// such as an empty directory, a junk file or a dangling gitfile, does not
+// count, and Clean removes the directory. A gitfile whose target the
+// worktree filesystem cannot reach, an absolute path or one above the
+// root, counts, which keeps more, never less. On a case-insensitive
+// filesystem the lookup also finds a .GIT.
+//
+// [1]: https://github.com/git/git/blob/v2.54.0/builtin/clean.c#L176-L177
+// [2]: https://github.com/git/git/blob/v2.54.0/dir.c#L1982-L1988
+// [3]: https://github.com/git/git/blob/v2.54.0/setup.c#L456-L471
+func isNestedRepository(fs billy.Filesystem, path string) bool {
+	gitPath := fs.Join(path, GitDirName)
+	fi, err := fs.Lstat(gitPath)
+	if err != nil {
+		return false
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		// Git follows a .git symlink. Reading through it would be
+		// refused as a leading symlink, so look at its target as a
+		// path of its own. One the worktree cannot reach keeps the
+		// directory.
+		link, err := fs.Readlink(gitPath)
+		if err != nil {
+			return true
+		}
+		if target, ok := worktreeRelative(path, link); ok {
+			return isGitDirectory(fs, target)
+		}
+		return true
+	}
+	if fi.IsDir() {
+		return isGitDirectory(fs, gitPath)
+	}
+	if !fi.Mode().IsRegular() {
+		return false
+	}
+
+	content, err := readGitFile(fs, gitPath)
+	if errors.Is(err, errGitFileTooLarge) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	target, ok := strings.CutPrefix(string(content), "gitdir: ")
+	if !ok {
+		return false
+	}
+	target, ok = worktreeRelative(path, strings.TrimRight(target, "\r\n"))
+	if !ok {
+		return true
+	}
+	return isGitDirectory(fs, target)
+}
+
+// worktreeRelative resolves target, taken from a file or link in dir,
+// to a path under the worktree root. It reports false for a target that
+// is absolute or leaves the root, which the worktree filesystem cannot
+// reach.
+func worktreeRelative(dir, target string) (string, bool) {
+	if filepath.IsAbs(target) {
+		return "", false
+	}
+	target = filepath.Join(dir, target)
+	if target == ".." || strings.HasPrefix(target, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return target, true
+}
+
+// maxGitFileSize is the largest gitfile Git reads, see read_gitfile_gently
+// in setup.c. A commondir file gets the same bound.
+const maxGitFileSize = 1 << 20
+
+var errGitFileTooLarge = errors.New("file too large")
+
+// readGitFile reads a gitfile or commondir file, refusing more than Git
+// does, so a huge file is not read into memory.
+func readGitFile(fs billy.Filesystem, path string) ([]byte, error) {
+	f, err := fs.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	content, err := io.ReadAll(io.LimitReader(f, maxGitFileSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > maxGitFileSize {
+		return nil, errGitFileTooLarge
+	}
+	return content, nil
+}
+
+// isGitDirectory reports whether the directory at path looks like a Git
+// directory to Git: it holds HEAD, objects and refs [1]. A linked
+// worktree's directory keeps objects and refs in the common directory
+// named by its commondir file.
+//
+// [1]: https://github.com/git/git/blob/v2.54.0/setup.c#L362-L429
+func isGitDirectory(fs billy.Filesystem, path string) bool {
+	if _, err := fs.Lstat(fs.Join(path, "HEAD")); err != nil {
+		return false
+	}
+	common := path
+	if content, err := readGitFile(fs, fs.Join(path, "commondir")); err == nil {
+		var ok bool
+		common, ok = worktreeRelative(path, strings.TrimRight(string(content), "\r\n"))
+		if !ok {
+			return true
+		}
+	}
+	for _, name := range []string{"objects", "refs"} {
+		if fi, err := fs.Stat(fs.Join(common, name)); err != nil || !fi.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
 func (w *Worktree) doClean(status Status, opts *CleanOptions, guard cleanGuard, dir string, files []fs.DirEntry) error {
 	wfs := w.filesystem.walkFilesystem()
 	for _, fi := range files {
@@ -1436,7 +1589,7 @@ func (w *Worktree) doClean(status Status, opts *CleanOptions, guard cleanGuard, 
 		// relative path under the root
 		path := filepath.Join(dir, fi.Name())
 		if fi.IsDir() {
-			if !opts.Dir {
+			if !opts.Dir || (!guard.tracked(path) && isNestedRepository(wfs, path)) {
 				continue
 			}
 
