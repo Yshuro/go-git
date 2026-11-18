@@ -6593,6 +6593,8 @@ func TestCheckinAttributesKeepCRLF(t *testing.T) {
 		{name: "case folded in a nested file", path: "d/X.bin", files: map[string]string{"d/.gitattributes": "x.BIN -text\n"}, options: [][4]string{{"core", "", "ignorecase", "true"}}, want: true},
 		{name: "attr.tree", path: "d/s", files: map[string]string{".gitattributes": "d/s text\n"}, options: [][4]string{{"attr", "", "tree", "HEAD"}}, want: true},
 		{name: "clean filter", path: "d/s", files: map[string]string{".gitattributes": "d/s filter=f\n"}, options: [][4]string{{"filter", "f", "clean", "cat"}}, want: true},
+		{name: "process filter", path: "d/s", files: map[string]string{".gitattributes": "d/s filter=f\n"}, options: [][4]string{{"filter", "f", "process", "cat"}}, want: true},
+		{name: "required filter", path: "d/s", files: map[string]string{".gitattributes": "d/s filter=f\n"}, options: [][4]string{{"filter", "f", "required", "true"}}, want: true},
 		{name: "filter without a clean command", path: "d/s", files: map[string]string{".gitattributes": "d/s filter=f\n"}, options: [][4]string{{"filter", "f", "smudge", "cat"}}},
 		{name: "filter without a definition", path: "d/s", files: map[string]string{".gitattributes": "d/s filter=f\n"}},
 		{name: "NUL ends the line", path: "d/s", files: map[string]string{".gitattributes": "d/s -text\x00junk\n"}, want: true},
@@ -6840,4 +6842,54 @@ func TestCheckinAttributesReadGlobalFiles(t *testing.T) {
 	configured.Raw.SetOption("core", "", "attributesFile", "~/configured")
 	assert.True(t, keeps(configured, "a.configured"))
 	assert.False(t, keeps(configured, "a.xdg"), "core.attributesFile replaces the default location")
+}
+
+func TestCheckinAttributesGlobalFilesAreHostFilesOfStoredRepositories(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("GIT_ATTR_NOSYSTEM", "1")
+	require.NoError(t, os.MkdirAll(filepath.Join(home, ".config", "git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(home, ".config", "git", "attributes"), []byte("* -text\n"), 0o644))
+
+	r, err := Init(memory.NewStorage(), WithWorkTree(memfs.New()))
+	require.NoError(t, err)
+	w, err := r.Worktree()
+	require.NoError(t, err)
+
+	assert.False(t, newCheckinAttributes(w, nil, config.NewConfig()).keepsCRLF("a.txt"))
+}
+
+func TestCheckinAttributesGlobalConfiguration(t *testing.T) {
+	t.Setenv("GIT_ATTR_SOURCE", "")
+	dir := t.TempDir()
+	r, err := PlainInit(dir, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	w, err := r.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte("a.txt filter=f\n"), 0o644))
+
+	local := config.NewConfig()
+	global := config.NewConfig()
+	global.Raw.SetOption("filter", "f", "clean", "cat")
+
+	assert.False(t, newCheckinAttributes(w, nil, local).keepsCRLF("a.txt"))
+	assert.True(t, newCheckinAttributes(w, nil, local, global).keepsCRLF("a.txt"), "a filter of the global configuration")
+
+	treeSet := config.NewConfig()
+	treeSet.Raw.SetOption("attr", "", "tree", "HEAD")
+	assert.True(t, newCheckinAttributes(w, nil, local, treeSet).keepsCRLF("b.txt"), "attr.tree of the global configuration")
+
+	t.Setenv("GIT_ATTR_SOURCE", "HEAD")
+	assert.True(t, newCheckinAttributes(w, nil, local).keepsCRLF("b.txt"), "GIT_ATTR_SOURCE")
+}
+
+func TestParseBool(t *testing.T) {
+	t.Parallel()
+
+	for value, want := range map[string]bool{"1": true, "true": true, "yes": true, "ON": true, "0": false, "false": false, "no": false, "": false} {
+		assert.Equal(t, want, parseBool(value), value)
+	}
 }

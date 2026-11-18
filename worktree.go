@@ -699,7 +699,7 @@ func (w *Worktree) checkSkipWorktreeUpToDate(cfg *config.Config, t *object.Tree,
 	if len(skipped) == 0 {
 		return nil, nil
 	}
-	attrs := newCheckinAttributes(w, stored, cfg)
+	attrs := newCheckinAttributes(w, stored, scopedConfigs(cfg)...)
 
 	filesMap := buildFilePathMap(files)
 	var update merkletrie.Changes
