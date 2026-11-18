@@ -240,3 +240,89 @@ func (s *SuiteReader) TestReaderReadAfterHeaderError() {
 	s.Error(readErr)
 	s.Equal(0, n)
 }
+
+func (s *SuiteReader) TestHeaderRejectsNegativeSize() {
+	r, err := NewReader(bytes.NewReader(compress(s.T(), []byte("blob -1\x00"))), format.SHA1)
+	s.Require().NoError(err)
+	defer r.Close()
+
+	_, _, err = r.Header()
+	s.ErrorIs(err, ErrNegativeSize)
+}
+
+func (s *SuiteReader) TestReadBodyMatchesDeclaredSize() {
+	tests := []struct {
+		name    string
+		payload []byte
+		want    []byte
+		wantErr error
+	}{
+		{
+			name:    "exact",
+			payload: []byte("blob 5\x00hello"),
+			want:    []byte("hello"),
+		},
+		{
+			name:    "empty",
+			payload: []byte("tree 0\x00"),
+			want:    []byte{},
+		},
+		{
+			name:    "longer than declared",
+			payload: append([]byte("blob 1\x00"), bytes.Repeat([]byte{'A'}, 64<<10)...),
+			want:    []byte("A"),
+			wantErr: ErrOverflow,
+		},
+		{
+			name:    "non-empty body for empty object",
+			payload: []byte("tree 0\x00x"),
+			want:    []byte{},
+			wantErr: ErrOverflow,
+		},
+		{
+			name:    "shorter than declared",
+			payload: []byte("blob 5\x00hi"),
+			want:    []byte("hi"),
+			wantErr: io.ErrUnexpectedEOF,
+		},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			r, err := NewReader(bytes.NewReader(compress(s.T(), tt.payload)), format.SHA1)
+			s.Require().NoError(err)
+			defer r.Close()
+
+			_, _, err = r.Header()
+			s.Require().NoError(err)
+
+			got, err := io.ReadAll(r)
+			if tt.wantErr != nil {
+				s.ErrorIs(err, tt.wantErr)
+			} else {
+				s.NoError(err)
+			}
+			s.Equal(tt.want, got)
+
+			// The result is sticky across further reads.
+			var buf [16]byte
+			n, err := r.Read(buf[:])
+			s.Equal(0, n)
+			if tt.wantErr != nil {
+				s.ErrorIs(err, tt.wantErr)
+			} else {
+				s.ErrorIs(err, io.EOF)
+			}
+		})
+	}
+}
+
+func compress(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := zlib.NewWriter(&buf)
+	_, err := w.Write(payload)
+	assert.NoError(t, err)
+	assert.NoError(t, w.Close())
+	return buf.Bytes()
+}

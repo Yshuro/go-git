@@ -35,6 +35,8 @@ type Reader struct {
 	zlib         *sync.ZLibReader
 	hasher       plumbing.Hasher
 	objectFormat format.ObjectFormat
+	pending      int64 // number of unread bytes of the declared size
+	readErr      error // returned by every Read after the stream ends or fails
 	closed       bool
 }
 
@@ -77,6 +79,9 @@ func (r *Reader) Header() (t plumbing.ObjectType, size int64, err error) {
 		err = ErrHeader
 		return t, size, err
 	}
+	if size < 0 {
+		return t, 0, ErrNegativeSize
+	}
 
 	defer r.prepareForRead(t, size)
 	return t, size, err
@@ -112,6 +117,7 @@ func (r *Reader) readUntil(delim byte, budget int) ([]byte, int, error) {
 func (r *Reader) prepareForRead(t plumbing.ObjectType, size int64) {
 	r.hasher = plumbing.NewHasher(r.objectFormat, t, size)
 	r.multi = io.TeeReader(r.zlib, r.hasher)
+	r.pending = size
 }
 
 // Read reads len(p) bytes into p from the object data stream. It returns
@@ -122,12 +128,46 @@ func (r *Reader) prepareForRead(t plumbing.ObjectType, size int64) {
 // If Read encounters the end of the data stream it will return err == io.EOF,
 // either in the current call if n > 0 or in a subsequent call.
 //
+// Read never returns more bytes than the size declared in the header. It
+// returns ErrOverflow if the data stream holds more bytes than declared, and
+// io.ErrUnexpectedEOF if it holds fewer.
+//
 // Read returns ErrHeaderNotRead if Header has not been called successfully.
 func (r *Reader) Read(p []byte) (n int, err error) {
 	if r.multi == nil {
 		return 0, ErrHeaderNotRead
 	}
-	return r.multi.Read(p)
+	if r.readErr != nil {
+		return 0, r.readErr
+	}
+	if r.pending == 0 {
+		r.readErr = r.checkEnd()
+		return 0, r.readErr
+	}
+
+	if int64(len(p)) > r.pending {
+		p = p[:r.pending]
+	}
+	n, err = r.multi.Read(p)
+	r.pending -= int64(n)
+	if err == io.EOF && r.pending > 0 {
+		err = io.ErrUnexpectedEOF
+	}
+	if err != nil {
+		r.readErr = err
+	}
+	return n, err
+}
+
+// checkEnd reports whether the data stream ends exactly at the declared size.
+// It reads past the hasher, so any extra byte does not affect Hash.
+func (r *Reader) checkEnd() error {
+	var buf [1]byte
+	n, err := io.ReadFull(r.zlib, buf[:])
+	if n > 0 {
+		return ErrOverflow
+	}
+	return err
 }
 
 // Hash returns the hash of the object data stream that has been read so far.
